@@ -499,6 +499,7 @@
           <div id="taskBulkBar">
             <span id="taskSelCount" style="font-size:0.84rem;font-weight:600;color:var(--text-2)">0 selected</span>
             <button class="btn btn-success btn-sm" onclick="bulkMarkDone()">Mark Done</button>
+            <button class="btn btn-accent btn-sm" onclick="bulkAssign()">Assign To</button>
             <button class="btn btn-danger btn-sm" onclick="bulkDelete()">Delete Selected</button>
             <button class="btn btn-ghost btn-sm" onclick="clearTaskSelection()">Cancel</button>
           </div>
@@ -5994,6 +5995,75 @@
       if (n > 0) await batch.commit().catch(function (e) { toast('Save failed — please retry', 'error'); console.error(e); });
     }
     
+    // Ask which employee to assign to — returns employee object or null
+    function pickBulkDoer(rows) {
+      return new Promise(function (resolve) {
+        const emps = (APP.employees || []).filter(e => e.active !== false);
+        const names = rows.map(r => { const src = (APP.importedTaskGroups || []).find(x => x.id === r.id) || (APP.templates || []).find(x => x.id === r.id); return src ? src.name : r.id; });
+        const chips = names.slice(0, 4).map(n => '<span style="background:#eef3f9;border:1px solid #d5e0ee;border-radius:999px;padding:3px 10px;font-size:.76rem;font-weight:600;color:#2a4a6e">' + escHtml(n) + '</span>').join(' ') + (names.length > 4 ? ' <span style="font-size:.76rem;color:var(--text-2);font-weight:600">+' + (names.length - 4) + ' more</span>' : '');
+        const ov = document.createElement('div');
+        ov.style.cssText = 'position:fixed;inset:0;background:rgba(15,30,50,.45);backdrop-filter:blur(3px);z-index:10000;display:flex;align-items:center;justify-content:center';
+        ov.innerHTML = '<div style="background:#fff;border-radius:18px;padding:24px;width:min(440px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.3)">' +
+          '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">' +
+          '<div style="width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#2a5a8c,#3d82c4);display:flex;align-items:center;justify-content:center"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/></svg></div>' +
+          '<div><div style="font-size:1.1rem;font-weight:700;color:var(--text-1,#12263f)">Assign New Doer</div><div style="font-size:.8rem;color:var(--text-2)">' + rows.length + ' task(s) selected</div></div></div>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px">' + chips + '</div>' +
+          '<label style="display:block;font-size:.78rem;font-weight:700;color:var(--text-2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em">Assign to</label>' +
+          '<select id="bulkDoerSel" class="filter-select" style="width:100%"><option value="">— Select Employee —</option>' +
+          emps.map(e => '<option value="' + escHtml(e.id) + '">' + escHtml(e.name) + ' (' + escHtml(e.dept || '') + ')</option>').join('') + '</select>' +
+          '<div style="margin-top:14px;padding:10px 12px;border-radius:10px;background:#f3f8ee;border:1px solid #d6e8c8;font-size:.8rem;line-height:1.5;color:#3d5a2a">' +
+          '<div>✔ Upcoming and pending tasks move to the new doer</div><div>✔ All future tasks go to the new doer</div><div>✔ Completed tasks stay with the old doer as history</div></div>' +
+          '<div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px"><button class="btn btn-ghost btn-sm" id="bulkDoerNo">Cancel</button><button class="btn btn-accent btn-sm" id="bulkDoerYes" disabled style="opacity:.5">Assign</button></div></div>';
+        document.body.appendChild(ov);
+        const sel = ov.querySelector('#bulkDoerSel'), yes = ov.querySelector('#bulkDoerYes');
+        const done = function (v) { ov.remove(); resolve(v); };
+        sel.onchange = function () { yes.disabled = !sel.value; yes.style.opacity = sel.value ? '1' : '.5'; };
+        ov.querySelector('#bulkDoerNo').onclick = function () { done(null); };
+        ov.onclick = function (e) { if (e.target === ov) done(null); };
+        yes.onclick = function () { if (sel.value) done(emps.find(e => e.id === sel.value) || null); };
+      });
+    }
+
+    async function bulkAssign() {
+      const rows = getSelectedTaskRows(); if (!rows.length) return;
+      const emp = await pickBulkDoer(rows);
+      if (!emp) return;
+      toast('Assigning to ' + emp.name + '...', 'info');
+      const patch = { doerId: emp.id, doerName: emp.name };
+      const taskIds = rows.filter(r => r.imported).map(r => r.id);
+      const templateIds = rows.filter(r => !r.imported).map(r => r.id);
+      let batch = db.batch(); let n = 0; let instanceCount = 0;
+      const commitIfFull = async function () { if (n >= 450) { await batch.commit(); batch = db.batch(); n = 0; } };
+      try {
+        for (const id of taskIds) {
+          const snap = await db.doc('clients/' + APP.clientId + '/tasks/' + id).get();
+          if (snap.exists && snap.data().status === 'done') continue;
+          batch.update(db.doc('clients/' + APP.clientId + '/tasks/' + id), patch); n++; instanceCount++; await commitIfFull();
+        }
+        for (const id of templateIds) {
+          batch.update(db.doc('clients/' + APP.clientId + '/templates/' + id), patch); n++; await commitIfFull();
+          const snap = await db.collection('clients/' + APP.clientId + '/tasks').where('templateId', '==', id).get();
+          for (const d of snap.docs) {
+            if (d.data().status === 'done') continue;
+            batch.update(db.doc('clients/' + APP.clientId + '/tasks/' + d.id), patch); n++; instanceCount++; await commitIfFull();
+          }
+        }
+        if (n > 0) await batch.commit();
+      } catch (e) { console.error(e); toast('Assign failed — please retry', 'error'); return; }
+      const allIds = rows.map(r => r.id);
+      const hit = t => (allIds.includes(t.id) || templateIds.includes(t.templateId)) && t.status !== 'done';
+      APP.todayTasks.forEach(t => { if (hit(t)) Object.assign(t, patch); });
+      (APP.importedTaskGroups || []).forEach(t => { if (hit(t)) Object.assign(t, patch); });
+      APP.templates = (APP.templates || []).map(t => templateIds.includes(t.id) ? Object.assign({}, t, patch) : t);
+      clearTaskSelection(); APP._importedLoaded = false; APP._tmplLoaded = false;
+      IDB.del('clap_tasks_' + APP.clientId); IDB.del('clap_tmpl_' + APP.clientId);
+      try { sessionStorage.removeItem('clap_tmpl_' + APP.clientId); } catch (ex) { }
+      renderTasks(); updateTaskTabCounts();
+      writeAudit('Bulk assigned ' + rows.length + ' task(s) to ' + emp.name + ' (' + instanceCount + ' not-done instance(s) updated)', 'settings');
+      toast('Assigned ' + rows.length + ' task(s) to ' + emp.name + ' — ' + instanceCount + ' pending/upcoming instance(s) updated', 'success');
+      loadTemplatesData().then(function () { loadImportedTasksData().then(function () { renderTasks(); updateTaskTabCounts(); }); }).catch(function () { });
+    }
+
     async function bulkDelete() {
       const rows = getSelectedTaskRows(); if (!rows.length) return;
       const allNames = rows.map(r => {
