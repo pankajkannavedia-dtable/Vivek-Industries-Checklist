@@ -1,0 +1,122 @@
+<script>
+  /* ── google.script.run promisified + micro-batched ── */
+  const _gs = (function () {
+    let queue = [], timer = null;
+    function flush() {
+      const batch = queue; queue = []; timer = null;
+      google.script.run
+        .withSuccessHandler(function (res) {
+          if (!Array.isArray(res)) {
+            console.error('apiBatch returned non-array:', res, 'ops:', batch.map(b => b.op));
+            batch.forEach(b => b.reject(new Error(
+              'Server returned ' + (res === null ? 'null' : typeof res) +
+              ' for op "' + b.op + '". Check the Apps Script execution log.')));
+            return;
+          }
+          batch.forEach(function (b, i) {
+            const r = res[i];
+            r && r.ok ? b.resolve(r.data) : b.reject(new Error(r ? r.error : 'no response for op ' + b.op));
+          });
+        })
+        .withFailureHandler(err => batch.forEach(b => b.reject(err)))
+        .apiBatch(batch.map(b => ({ op: b.op, payload: b.payload })));
+    }
+    return function (op, payload) {
+      return new Promise((resolve, reject) => {
+        queue.push({ op, payload, resolve, reject });
+        if (!timer) timer = setTimeout(flush, 15);
+      });
+    };
+  })();
+
+  /* ── Firestore-compatible shim ── */
+  function _snap(rows, path) {
+    return {
+      size: rows.length,
+      docs: rows.map(r => ({ id: r.id, data: () => r, exists: true, ref: path ? _docRef(path, r.id) : undefined })),
+      empty: rows.length === 0
+    };
+  }
+  function _q(path, state) {
+    const s = state || { where: [], orderBy: null, limit: null };
+    return {
+      where(f, op, v) { return _q(path, { ...s, where: [...s.where, [f, op, v]] }); },
+      orderBy(f, d) { return _q(path, { ...s, orderBy: [f, d || 'asc'] }); },
+      limit(n) { return _q(path, { ...s, limit: n }); },
+      get() { return _gs('query', { path, ...s }).then(r => _snap(r, path)); },
+      add(data) { return _gs('add', { path, data }).then(r => ({ id: r.id })); },
+      doc(id) { return _docRef(path, id || (Date.now().toString(36) + Math.random().toString(36).slice(2))); },
+      onSnapshot(cb, errCb) {
+        let stop = false, timer = null, busy = false;
+        const POLL_MS = 30000;   // was 5000
+        const tick = () => {
+          if (stop) return;
+          if (document.hidden) { timer = setTimeout(tick, POLL_MS); return; }   // tab in background: skip the call
+          busy = true;
+          _gs('query', { path, ...s }).then(r => { if (!stop) cb(_snap(r, path)); }).catch(e => errCb && errCb(e))
+            .then(() => { busy = false; if (!stop) timer = setTimeout(tick, POLL_MS); });
+        };
+        // when the user comes back to the tab, refresh immediately
+        const onVis = () => { if (!document.hidden && !busy && !stop) { clearTimeout(timer); tick(); } };
+        document.addEventListener('visibilitychange', onVis);
+        tick();
+        return () => { stop = true; clearTimeout(timer); document.removeEventListener('visibilitychange', onVis); };
+      }
+    };
+  }
+  function _docRef(path, id) {
+    return {
+      id, path: path + '/' + id,
+      get() { return _gs('getDoc', { path, id }).then(d => ({ exists: !!d, id, data: () => d || {} })); },
+      set(data, opt) { return _gs('set', { path, id, data, merge: !!(opt && opt.merge) }); },
+      update(data) { return _gs('update', { path, id, data }); },
+      delete() { return _gs('del', { path, id }); },
+      collection(sub) { return _q(path + '/' + id + '/' + sub); }
+    };
+  }
+  function _splitDoc(full) {
+    const p = full.split('/'); const id = p.pop(); return { path: p.join('/'), id };
+  }
+
+  const db = {
+    collection: (p) => _q(p),
+    doc: (full) => { const { path, id } = _splitDoc(full); return _docRef(path, id); },
+    batch() {
+      const ops = [];
+      return {
+        set(ref, data, opt) { const { path, id } = _splitDoc(ref.path); ops.push({ type: 'set', path, id, data, merge: !!(opt && opt.merge) }); },
+        update(ref, data) { const { path, id } = _splitDoc(ref.path); ops.push({ type: 'update', path, id, data }); },
+        delete(ref) { const { path, id } = _splitDoc(ref.path); ops.push({ type: 'delete', path, id }); },
+        commit() { return _gs('batch', { ops }); }
+      };
+    },
+    enablePersistence() { return Promise.resolve(); }
+  };
+
+  const firebase = {
+    initializeApp() { },
+    firestore: Object.assign(() => db, { FieldValue: { serverTimestamp: () => new Date().toISOString() } }),
+    storage: () => ({
+      ref(path) {
+        return {
+          put(file) {
+            return new Promise((res, rej) => {
+              const rd = new FileReader();
+              rd.onload = () => {
+                const b64 = rd.result.split(',')[1];
+                _gs('uploadFile', { base64: b64, mime: file.type, name: file.name })
+                  .then(r => { this._url = r.url; res({}); }).catch(rej);
+              };
+              rd.onerror = rej; rd.readAsDataURL(file);
+            });
+          },
+          getDownloadURL() { return Promise.resolve(this._url); }
+        };
+      }
+    })
+  };
+  firebase.firestore.FieldValue = { serverTimestamp: () => new Date().toISOString() };
+
+  /* ── Cloud Function replacement ── */
+  async function callCF(fn, data) { return _gs(fn, data || {}); }
+</script>
